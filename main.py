@@ -542,13 +542,12 @@ def main():
     random.seed(train_config.seed)
     
     wandb.init(
-        entity="sprutz-rutgers-university-org",
         project="llama-tune",
         config = {
-            model : train_config.model_name,
-            epochs : train_config.num_epochs,
-            lr : train_config.lr,
-            seed : train_config.seed,
+            "model" : train_config.model_name,
+            "epochs" : train_config.num_epochs,
+            "lr" : train_config.lr,
+            "seed" : train_config.seed,
         }
     )
     
@@ -596,19 +595,23 @@ def main():
         )
     scheduler = StepLR(optimizer, step_size=1, gamma=train_config.gamma)
     
-    results = train(
-        model,
-        train_dataloader,
-        eval_dataloader,
-        processor.tokenizer,
-        optimizer,
-        scheduler,
-        train_config.gradient_accumulation_steps,
-        train_config,
-        fsdp_config if train_config.enable_fsdp else None,
-        local_rank if train_config.enable_fsdp else None,
-        rank if train_config.enable_fsdp else None,
-    )
+    try:
+        results = train(
+            model,
+            train_dataloader,
+            eval_dataloader,
+            processor.tokenizer,
+            optimizer,
+            scheduler,
+            train_config.gradient_accumulation_steps,
+            train_config,
+            fsdp_config if train_config.enable_fsdp else None,
+            local_rank if train_config.enable_fsdp else None,
+            rank if train_config.enable_fsdp else None,
+        )
+    finally:
+        if train_config.enable_fsdp:
+            dist.destroy_process_group()
     
     wandb.finish()
 
