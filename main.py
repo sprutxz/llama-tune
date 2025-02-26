@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import Iterator, List
+import copy
 
 import torch
 import torch.distributed as dist
@@ -163,7 +164,7 @@ class DisHallDataCollator:
                     {
                         "role": "user",
                         "content": [
-                            {type: "image"},
+                            {"type": "image"},
                             {"type": "text", "text": qnas["question"].strip()},
                         ],
                     },
