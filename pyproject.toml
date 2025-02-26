@@ -1,0 +1,13 @@
+[project]
+name = "llama-tune"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "datasets>=3.3.2",
+    "torch>=2.6.0",
+    "tqdm>=4.67.1",
+    "transformers>=4.49.0",
+    "wandb>=0.19.7",
+]
