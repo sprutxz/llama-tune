@@ -802,6 +802,14 @@ def main():
     
     model, processor = get_model_and_processor(train_config= train_config)
     
+    # Convert all model parameters to bfloat16 to ensure uniform dtype
+    if train_config.use_peft:
+        for name, param in model.named_parameters():
+            if param.dtype != torch.bfloat16:
+                param.data = param.data.to(torch.bfloat16)
+                if rank == 0:
+                    print(f"Converted parameter {name} from {param.dtype} to torch.bfloat16")
+    
     log_gpu_memory("After model initialization", rank=rank)
     
     mixed_precision_policy, wrap_policy = get_polices()
