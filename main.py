@@ -820,7 +820,8 @@ def main():
             mixed_precision=mixed_precision_policy,
             sharding_strategy=fsdp_config.sharding_strategy,
             device_id=device_id,
-            limit_all_gathers=True
+            limit_all_gathers=True,
+            use_orig_params=True  # Add this line
         )
     
     log_gpu_memory("After FSDP wrapping", rank=rank)
