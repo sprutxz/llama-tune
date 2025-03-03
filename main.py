@@ -107,21 +107,6 @@ class fsdp_config:
     fsdp_cpu_offload: bool=False
     pure_bf16: bool = True
     optimizer: str= "AdamW"
-    
-def resize_image(img, max_dimension = 1120):
-    original_width, original_height = img.size
-
-    if original_width > original_height:
-        scaling_factor = max_dimension / original_width
-    else:
-        scaling_factor = max_dimension / original_height
-
-    new_width = int(original_width * scaling_factor)
-    new_height = int(original_height * scaling_factor)
-
-    # Resize the image while maintaining the aspect ratio
-    resized_img = img.resize((new_width, new_height))
-    return resized_img
 
 # check system prompt token seq or user prompt token seq is in the current token list
 def check_header(targets, seq):
@@ -183,282 +168,143 @@ def tokenize_dialogs(dialogs, images, processor):
         label_list.append(labels)
     batch["labels"] = torch.tensor(label_list)
     return batch
-    
-class VibeEvalDataCollator:
-    
+
+
+class DisHallDataCollator:
     def __init__(self, processor):
         self.processor = processor
-        self.processor.tokenizer.padding_side = "right"
-    
+        self.processor.tokenizer.padding_side = (
+            "right"  # during training, one always uses padding on the right
+        )
+
     def __call__(self, samples):
         dialogs, images = [], []
-        for sample in samples:  
-            image, prompt, reference = sample["image"], sample["prompt"], sample["reference"]
-            image = resize_image(image.convert("RGB"))
-            dialog = [
-                {
-                    "role":"user",
-                    "content": [
-                        {
-                            "type":"image"
-                        },
-                        {
-                            "type":"text",
-                            "text":prompt.strip()
-                        }
-                    ]
-                },
-                {
-                    "role":"assistant",
-                    "content":[
-                        {
-                            "type":"text",
-                            "text":reference.strip()
-                        }
-                    ]
-                }
-            ]
-            dialogs.append(dialog)
-            images.append([image])      
-        return tokenize_dialogs(dialogs,images, self.processor)
-    
+        for sample in samples:
+            image, qa_pairs = sample["image"], sample["QA_pairs"]
+
+            image = image.convert("RGB")  # only use the first image
+
+            for qnas in qa_pairs:
+                dialog = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image"},
+                            {"type": "text", "text": qnas["question"].strip()},
+                        ],
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": qnas["answer"].strip()},
+                        ],
+                    },
+                ]
+                dialogs.append(dialog)
+                images.append(image)
+        return tokenize_dialogs(dialogs, images, self.processor) 
+
 def get_data_collator(processor):
-    return VibeEvalDataCollator(processor)
+    return DisHallDataCollator(processor)
 
+class SimpleDistributedSampler(Sampler):
+    """
+    A simplified distributed sampler that evenly divides the dataset across processes.
+    """
 
-
-class LengthBasedBatchSampler(torch.utils.data.BatchSampler):
-    
-    def __init__(self, data_source, batch_size: int, drop_last: bool, shuffle: bool=True):
-        if isinstance(next(iter(data_source)), dict):
-            self.lengths = [len(d["prompt"]) for d in data_source]
-        
-        else:
-            self.lengths = [len(d) for d in data_source]
-
-        self.batch_size = batch_size
-        self.drop_last = drop_last
-        self.shuffle = shuffle
-    
-    def __iter__(self):
-
-        ids = np.argsort(self.lengths, kind='mergesort')
-        #we now have index sorted in ascending order
-        if self.drop_last:
-            ids = ids[:len(ids)//self.batch_size*self.batch_size]
-            
-        batches = [ids[i:i+self.batch_size] for i in range(0, len(ids), self.batch_size)]
-        
-        if self.shuffle:
-            random.shuffle(batches)
-        
-        for b in batches:
-            yield b
-    
-    def __len__(self):
-        if self.drop_last:
-            return len(self.lengths)//self.batch_size
-        
-        return len(self.lengths) // self.batch_size + (len(self.lengths) % self.batch_size > 0)
-    
-class DistributedLengthBasedBatchSampler(torch.utils.data.BatchSampler):
-    
-    def __init__(self, data_source, batch_size: int, num_replicas: int, rank: int, shuffle: bool = True, seed: int = 0):
-        random.seed(seed)
-        self.batch_sampler = LengthBasedBatchSampler(
-            data_source, batch_size=batch_size, drop_last=True, shuffle=shuffle
-        )
+    def __init__(self, dataset, num_replicas: int, rank: int, shuffle: bool = True, seed: int = 54):
+        """
+        Args:
+            dataset: Dataset to sample from
+            num_replicas: Number of processes/GPUs
+            rank: Process rank
+            shuffle: Whether to shuffle the indices
+            seed: Random seed for reproducibility
+        """
+        self.dataset = dataset
         self.num_replicas = num_replicas
         self.rank = rank
-        print(self.num_replicas)
+        self.epoch = 0
+        self.shuffle = shuffle
+        self.seed = seed
 
-    def __iter__(self):
-        max_length = len(self.batch_sampler) // self.num_replicas * self.num_replicas
-        return islice(self.batch_sampler, self.rank, max_length, self.num_replicas)
-        #Here, since we are creating distributed sampler. what islice is doing here is just we are filtering batches with params (iterable, start, end, steps)
-        #for example we have [batch_0, batch_1, batch_2, batch_3, batch_4, batch_5, batch_6, batch_7, batch_8, batch_9, batch_10, ...] , max_length=10, replica=2
-        #for rank 1 it will only use [batch_1, batch_3, batch_5, batch_7, batch_9]
-    
-    def __len__(self):
-        return len(self.batch_sampler) // self.num_replicas
+        # Make sure each process gets same number of batches
+        self.num_samples = len(self.dataset) // self.num_replicas
+        self.total_size = self.num_samples * self.num_replicas
+
+    def __iter__(self) -> Iterator[int]:
+        # Deterministically shuffle based on epoch and seed
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            indices = torch.randperm(len(self.dataset), generator=g).tolist()
+        else:
+            indices = list(range(len(self.dataset)))
+
+        # Truncate to make it evenly divisible across processes
+        indices = indices[:self.total_size]
+        assert len(indices) == self.total_size
+
+        # Get subset for this rank
+        indices = indices[self.rank:self.total_size:self.num_replicas]
+        assert len(indices) == self.num_samples
+
+        return iter(indices)
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def set_epoch(self, epoch: int) -> None:
+        """
+        Sets the epoch for this sampler. This ensures different shuffling
+        order at each epoch when shuffle=True
+        """
+        self.epoch = epoch
 
 def get_dataloaders(train_config, processor):
-    data = get_custom_dataset()
-    dataset_train = data["train"]
-    dataset_val = data["test"]
-    
+    # Get dataset using the dataset config and processor
+    dataset_train = get_custom_dataset(None, processor, "train")
+    dataset_val = get_custom_dataset(None, processor, "test")
+
     data_collator = get_data_collator(processor)
-    train_kwargs = {
-        "batch_sampler": DistributedLengthBasedBatchSampler(
-                dataset_train,
-                batch_size=train_config.batch_size_training,
-                rank=dist.get_rank(),
-                num_replicas=dist.get_world_size(),
-                shuffle=True,
-            ),
-        "collate_fn" : data_collator
-    }
+
+    # Create train sampler using SimpleDistributedSampler
+    train_sampler = SimpleDistributedSampler(
+        dataset=dataset_train,
+        num_replicas=dist.get_world_size(),
+        rank=dist.get_rank(),
+        shuffle=True
+    )
+
+    # Create train dataloader with batch_size parameter (instead of batch_sampler)
     train_dataloader = torch.utils.data.DataLoader(
         dataset_train,
+        batch_size=train_config.batch_size_training,
+        sampler=train_sampler,
+        collate_fn=data_collator,
         num_workers=2,
         pin_memory=True,
-        **train_kwargs,
     )
-    
-    valid_kwargs = {
-        "batch_sampler": DistributedLengthBasedBatchSampler(
-                dataset_val,
-                batch_size=1,
-                rank=dist.get_rank(),
-                num_replicas=dist.get_world_size(),
-                shuffle=False,
-            ),
-        "collate_fn" : data_collator
-    }
+
+    # Create validation sampler
+    val_sampler = SimpleDistributedSampler(
+        dataset=dataset_val,
+        num_replicas=dist.get_world_size(),
+        rank=dist.get_rank(),
+        shuffle=False
+    )
+
+    # Create validation dataloader
     valid_dataloader = torch.utils.data.DataLoader(
         dataset_val,
+        batch_size=train_config.val_batch_size,
+        sampler=val_sampler,
+        collate_fn=data_collator,
         num_workers=2,
         pin_memory=True,
-        **valid_kwargs,
     )
-    
+
     return train_dataloader, valid_dataloader
-
-# class DisHallDataCollator:
-#     def __init__(self, processor):
-#         self.processor = processor
-#         self.processor.tokenizer.padding_side = (
-#             "right"  # during training, one always uses padding on the right
-#         )
-#
-#     def __call__(self, samples):
-#         dialogs, images = [], []
-#         for sample in samples:
-#             image, qa_pairs = sample["image"], sample["QA_pairs"]
-#
-#             image = image.convert("RGB")  # only use the first image
-#
-#             for qnas in qa_pairs:
-#                 dialog = [
-#                     {
-#                         "role": "user",
-#                         "content": [
-#                             {"type": "image"},
-#                             {"type": "text", "text": qnas["question"].strip()},
-#                         ],
-#                     },
-#                     {
-#                         "role": "assistant",
-#                         "content": [
-#                             {"type": "text", "text": qnas["answer"].strip()},
-#                         ],
-#                     },
-#                 ]
-#                 dialogs.append(dialog)
-#                 images.append(image)
-#         return tokenize_dialogs(dialogs, images, self.processor) 
-#
-# def get_data_collator(processor):
-#     return DisHallDataCollator(processor)
-
-# class SimpleDistributedSampler(Sampler):
-#     """
-#     A simplified distributed sampler that evenly divides the dataset across processes.
-#     """
-#
-#     def __init__(self, dataset, num_replicas: int, rank: int, shuffle: bool = True, seed: int = 54):
-#         """
-#         Args:
-#             dataset: Dataset to sample from
-#             num_replicas: Number of processes/GPUs
-#             rank: Process rank
-#             shuffle: Whether to shuffle the indices
-#             seed: Random seed for reproducibility
-#         """
-#         self.dataset = dataset
-#         self.num_replicas = num_replicas
-#         self.rank = rank
-#         self.epoch = 0
-#         self.shuffle = shuffle
-#         self.seed = seed
-#
-#         # Make sure each process gets same number of batches
-#         self.num_samples = len(self.dataset) // self.num_replicas
-#         self.total_size = self.num_samples * self.num_replicas
-#
-#     def __iter__(self) -> Iterator[int]:
-#         # Deterministically shuffle based on epoch and seed
-#         if self.shuffle:
-#             g = torch.Generator()
-#             g.manual_seed(self.seed + self.epoch)
-#             indices = torch.randperm(len(self.dataset), generator=g).tolist()
-#         else:
-#             indices = list(range(len(self.dataset)))
-#
-#         # Truncate to make it evenly divisible across processes
-#         indices = indices[:self.total_size]
-#         assert len(indices) == self.total_size
-#
-#         # Get subset for this rank
-#         indices = indices[self.rank:self.total_size:self.num_replicas]
-#         assert len(indices) == self.num_samples
-#
-#         return iter(indices)
-#
-#     def __len__(self) -> int:
-#         return self.num_samples
-#
-#     def set_epoch(self, epoch: int) -> None:
-#         """
-#         Sets the epoch for this sampler. This ensures different shuffling
-#         order at each epoch when shuffle=True
-#         """
-#         self.epoch = epoch
-#
-# def get_dataloaders(train_config, processor):
-#     # Get dataset using the dataset config and processor
-#     dataset_train = get_custom_dataset(None, processor, "train")
-#     dataset_val = get_custom_dataset(None, processor, "test")
-#
-#     data_collator = get_data_collator(processor)
-#
-#     # Create train sampler using SimpleDistributedSampler
-#     train_sampler = SimpleDistributedSampler(
-#         dataset=dataset_train,
-#         num_replicas=dist.get_world_size(),
-#         rank=dist.get_rank(),
-#         shuffle=True
-#     )
-#
-#     # Create train dataloader with batch_size parameter (instead of batch_sampler)
-#     train_dataloader = torch.utils.data.DataLoader(
-#         dataset_train,
-#         batch_size=train_config.batch_size_training,
-#         sampler=train_sampler,
-#         collate_fn=data_collator,
-#         num_workers=2,
-#         pin_memory=True,
-#     )
-#
-#     # Create validation sampler
-#     val_sampler = SimpleDistributedSampler(
-#         dataset=dataset_val,
-#         num_replicas=dist.get_world_size(),
-#         rank=dist.get_rank(),
-#         shuffle=False
-#     )
-#
-#     # Create validation dataloader
-#     valid_dataloader = torch.utils.data.DataLoader(
-#         dataset_val,
-#         batch_size=train_config.val_batch_size,
-#         sampler=val_sampler,
-#         collate_fn=data_collator,
-#         num_workers=2,
-#         pin_memory=True,
-#     )
-#
-#     return train_dataloader, valid_dataloader
 
 # In get_model_and_processor function:
 def get_model_and_processor(train_config):
