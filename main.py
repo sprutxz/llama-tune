@@ -137,7 +137,6 @@ def replace_target(target, seq):
             seq[i], seq[i + 1], seq[i + 2] = -100, -100, -100
     return seq
 
-
 def get_custom_dataset(dataset_config, processor, split, split_ratio=0.9):
     # load_dataset will return DatasetDict that contains all the data in the train set
     dataset_dict = load_dataset("Sprutz/DisHall")
@@ -184,7 +183,6 @@ def tokenize_dialogs(dialogs, images, processor):
         label_list.append(labels)
     batch["labels"] = torch.tensor(label_list)
     return batch
-
 
 class DisHallDataCollator:
     def __init__(self, processor):
@@ -337,8 +335,6 @@ def get_model_and_processor(train_config):
     if not processor.tokenizer.pad_token_id:
         processor.tokenizer.pad_token_id = processor.tokenizer.eos_token_id
         
-    # If there is a mismatch between tokenizer vocab size and embedding matrix,
-    # throw a warning and then expand the embedding matrix
     if len(processor.tokenizer) > model.get_input_embeddings().weight.shape[0]:
         print("WARNING: Resizing the embedding matrix to match the tokenizer vocab size.")
         model.resize_token_embeddings(len(processor.tokenizer))
@@ -353,6 +349,12 @@ def get_model_and_processor(train_config):
         )
         model = get_peft_model(model, peft_config)
         print("Applied PEFT (LoRA) to model")
+        
+        # Convert all PEFT adapter parameters to bfloat16
+        for name, param in model.named_parameters():
+            if param.dtype == torch.float32:
+                param.data = param.data.to(torch.bfloat16)
+                print(f"Converted parameter {name} from float32 to bfloat16")
     
     return model, processor
 
@@ -678,7 +680,8 @@ def main():
             mixed_precision=mixed_precision_policy,
             sharding_strategy=fsdp_config.sharding_strategy,
             device_id=device_id,
-            limit_all_gathers=True
+            limit_all_gathers=True,
+            use_orig_params=True  # Add this line
         )
     
     log_gpu_memory("After FSDP wrapping", rank=rank)
