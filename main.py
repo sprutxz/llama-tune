@@ -107,6 +107,21 @@ class fsdp_config:
     fsdp_cpu_offload: bool=False
     pure_bf16: bool = True
     optimizer: str= "AdamW"
+    
+def resize_image(img, max_dimension = 1120):
+    original_width, original_height = img.size
+
+    if original_width > original_height:
+        scaling_factor = max_dimension / original_width
+    else:
+        scaling_factor = max_dimension / original_height
+
+    new_width = int(original_width * scaling_factor)
+    new_height = int(original_height * scaling_factor)
+
+    # Resize the image while maintaining the aspect ratio
+    resized_img = img.resize((new_width, new_height))
+    return resized_img
 
 # check system prompt token seq or user prompt token seq is in the current token list
 def check_header(targets, seq):
@@ -122,14 +137,15 @@ def replace_target(target, seq):
             seq[i], seq[i + 1], seq[i + 2] = -100, -100, -100
     return seq
 
-def get_custom_dataset():
-    dataset_dict = load_dataset("RekaAI/VibeEval")
-    dataset = dataset_dict["test"]
-    
-    return DatasetDict({
-        "train": dataset.select(range(10,268)),
-        "test": dataset.select(range(10))
-    })
+
+def get_custom_dataset(dataset_config, processor, split, split_ratio=0.9):
+    # load_dataset will return DatasetDict that contains all the data in the train set
+    dataset_dict = load_dataset("Sprutz/DisHall")
+    dataset = dataset_dict["train"]
+    dataset = dataset.train_test_split(
+        test_size=1 - split_ratio, shuffle=True, seed=54
+    )[split]
+    return dataset
 
 def tokenize_dialogs(dialogs, images, processor):
     text_prompt = processor.apply_chat_template(dialogs)
@@ -321,6 +337,8 @@ def get_model_and_processor(train_config):
     if not processor.tokenizer.pad_token_id:
         processor.tokenizer.pad_token_id = processor.tokenizer.eos_token_id
         
+    # If there is a mismatch between tokenizer vocab size and embedding matrix,
+    # throw a warning and then expand the embedding matrix
     if len(processor.tokenizer) > model.get_input_embeddings().weight.shape[0]:
         print("WARNING: Resizing the embedding matrix to match the tokenizer vocab size.")
         model.resize_token_embeddings(len(processor.tokenizer))
@@ -335,12 +353,6 @@ def get_model_and_processor(train_config):
         )
         model = get_peft_model(model, peft_config)
         print("Applied PEFT (LoRA) to model")
-        
-        # Convert all PEFT adapter parameters to bfloat16
-        for name, param in model.named_parameters():
-            if param.dtype == torch.float32:
-                param.data = param.data.to(torch.bfloat16)
-                print(f"Converted parameter {name} from float32 to bfloat16")
     
     return model, processor
 
@@ -666,8 +678,7 @@ def main():
             mixed_precision=mixed_precision_policy,
             sharding_strategy=fsdp_config.sharding_strategy,
             device_id=device_id,
-            limit_all_gathers=True,
-            use_orig_params=True  # Add this line
+            limit_all_gathers=True
         )
     
     log_gpu_memory("After FSDP wrapping", rank=rank)
