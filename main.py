@@ -42,6 +42,34 @@ from transformers.models.mllama.modeling_mllama import (
 import wandb
 
 
+# Add GPU memory tracking functions
+def get_gpu_memory_info():
+    """Return detailed GPU memory usage information in a formatted string"""
+    if not torch.cuda.is_available():
+        return "CUDA not available"
+    
+    device = torch.cuda.current_device()
+    allocated = torch.cuda.memory_allocated(device) / (1024 ** 3)  # GB
+    max_allocated = torch.cuda.max_memory_allocated(device) / (1024 ** 3)  # GB
+    reserved = torch.cuda.memory_reserved(device) / (1024 ** 3)  # GB
+    max_reserved = torch.cuda.max_memory_reserved(device) / (1024 ** 3)  # GB
+    
+    return (f"GPU {device}: "
+            f"Allocated: {allocated:.2f}GB (Max: {max_allocated:.2f}GB), "
+            f"Reserved: {reserved:.2f}GB (Max: {max_reserved:.2f}GB)")
+
+def log_gpu_memory(message="", reset_peak=False, rank=0):
+    """Log GPU memory usage with an optional message"""
+    if not torch.cuda.is_available():
+        return
+    
+    if rank == 0:  # Only log on main process
+        memory_info = get_gpu_memory_info()
+        print(f"[MEMORY] {message} - {memory_info}")
+    
+    if reset_peak:
+        torch.cuda.reset_peak_memory_stats()
+
 @dataclass
 class train_config:
     model_name: str="meta-llama/Llama-3.2-11B-Vision-Instruct"
@@ -591,7 +619,7 @@ def save_model_and_optimizer_sharded(model, rank, cfg,optim=None):
             f"Checkpoint Time = {t1-t0:.4f}\n"
         )
 
-def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_scheduler, gradient_accumulation_steps, train_config, fsdp_config=None, local_rank=None, rank=None, wandb_run=None):
+def train(model, train_dataloader, eval_dataloader, tokenizer, optimizer, lr_scheduler, gradient_accumulation_steps, train_config, fsdp_config=None, local_rank=None, rank=None, wandb_run=None):
     world_size = int(os.environ["WORLD_SIZE"])
     
     train_prep = []
@@ -607,6 +635,9 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
     checkpoint_times = []
     results = {}
     
+    # Log initial memory state
+    log_gpu_memory("Training start", reset_peak=True, rank=rank)
+    
     for epoch in range(train_config.num_epochs):
         print(f"Starting epoch {epoch}/{train_config.num_epochs}")
         epoch_start_time = time.perf_counter()
@@ -616,9 +647,20 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
         total_length = len(train_dataloader)//gradient_accumulation_steps
         pbar = tqdm(colour="blue", desc=f"Training Epoch: {epoch+1}", total=total_length, dynamic_ncols=True)
         
+        log_gpu_memory(f"Epoch {epoch+1} start", rank=rank)
+        
         for step, batch in enumerate(train_dataloader):
+            # Memory tracking before batch processing
+            if step % 10 == 0:  # Log every 10 steps to avoid excessive output
+                log_gpu_memory(f"Epoch {epoch+1}, Step {step} before batch", rank=rank)
+            
             for key in batch.keys():
                 batch[key] = batch[key].to(local_rank)
+            
+            # Memory after moving batch to GPU
+            if step % 10 == 0:
+                log_gpu_memory(f"Epoch {epoch+1}, Step {step} after batch to GPU", rank=rank)
+            
             loss = model(**batch).loss
             loss = loss/gradient_accumulation_steps
             
@@ -626,16 +668,36 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
             train_step_perplexity.append(float(torch.exp(loss.detach().float())))
             
             total_loss += loss.detach().float()
+            
+            # Memory before backward pass
+            if step % 10 == 0:
+                log_gpu_memory(f"Epoch {epoch+1}, Step {step} before backward", rank=rank)
+            
             loss.backward()
             
+            # Memory after backward pass
+            if step % 10 == 0:
+                log_gpu_memory(f"Epoch {epoch+1}, Step {step} after backward", rank=rank)
+            
             if (step+1) % gradient_accumulation_steps == 0 or step == len(train_dataloader)+1:
+                # Memory before optimizer step
+                if step % 10 == 0:
+                    log_gpu_memory(f"Epoch {epoch+1}, Step {step} before optimizer step", rank=rank)
+                
                 optimizer.step()
                 optimizer.zero_grad()
+                
+                # Memory after optimizer step
+                if step % 10 == 0:
+                    log_gpu_memory(f"Epoch {epoch+1}, Step {step} after optimizer step", rank=rank)
+                
                 pbar.update(1)
                 
             pbar.set_description(f"Training Epoch: {epoch+1}/{train_config.num_epochs}, step {step}/{len(train_dataloader)} completed (loss: {loss.detach().float()})")
         
         pbar.close()
+        log_gpu_memory(f"End of epoch {epoch+1}", rank=rank)
+        
         epoch_end_time = time.perf_counter()-epoch_start_time
         epoch_times.append(epoch_end_time)
         
@@ -653,7 +715,10 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
         lr_scheduler.step()
             
     dist.barrier()
-    if fsdp_config.checkpoint_type == StateDictType.FULL_STATE_DICT: #it saves all the checkpoint in rank 0
+    
+    log_gpu_memory("Before saving checkpoint", rank=rank)
+    
+    if fsdp_config.checkpoint_type == StateDictType.FULL_STATE_DICT:
         save_fsdp_model_checkpoint_full(
                     model, optimizer, rank, train_config, epoch=epoch
                 )
@@ -661,7 +726,7 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
             save_optimizer_checkpoint(
                         model, optimizer, rank, train_config, epoch=epoch
                     )
-    elif fsdp_config.checkpoint_type == StateDictType.SHARDED_STATE_DICT: #saves in sharded form
+    elif fsdp_config.checkpoint_type == StateDictType.SHARDED_STATE_DICT:
         if train_config.save_optimizer:
             print(" Saving the FSDP model checkpoints using SHARDED_STATE_DICT")
             print("=====================================================")
@@ -670,6 +735,8 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
             print(" Saving the FSDP model checkpoints and optimizer using SHARDED_STATE_DICT")
             print("=====================================================")
             save_model_and_optimizer_sharded(model, rank, train_config)
+    
+    log_gpu_memory("After saving checkpoint", rank=rank)
     
     dist.barrier()
     
@@ -690,6 +757,9 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
 def main():
     torch.manual_seed(train_config.seed)
     random.seed(train_config.seed)
+    
+    local_rank = 0
+    rank = 0
     
     wandb.init(
         project="llama-tune",
@@ -714,9 +784,16 @@ def main():
         os.environ["TORCH_SHOW_CPP_STACKTRACES"] = str(1)
         os.environ["NCCL_ASYNC_ERROR_HANDLING"] = str(1)
     
+    log_gpu_memory("Before model initialization", reset_peak=True, rank=rank)
+    
     model, processor = get_model_and_processor(train_config= train_config)
+    
+    log_gpu_memory("After model initialization", rank=rank)
+    
     mixed_precision_policy, wrap_policy = get_polices()
     device_id = torch.cuda.current_device()
+    
+    log_gpu_memory("Before FSDP wrapping", rank=rank)
     
     model = FSDP(
             model,
@@ -728,15 +805,21 @@ def main():
             limit_all_gathers=True
         )
     
+    log_gpu_memory("After FSDP wrapping", rank=rank)
+    
     if fsdp_config.fsdp_activation_checkpointing:
         model.enable_input_require_grads()
         model.gradient_checkpointing_enable()
-        apply_fsdp_checkpointing(model)  
+        apply_fsdp_checkpointing(model)
+        
+        log_gpu_memory("After activation checkpointing setup", rank=rank)
     
     train_dataloader , eval_dataloader = get_dataloaders(
         train_config= train_config,
         processor= processor
     )
+    
+    log_gpu_memory("After dataloader creation", rank=rank)
     
     optimizer = optim.AdamW(
             model.parameters(),
@@ -744,6 +827,8 @@ def main():
             weight_decay=train_config.weight_decay,
         )
     scheduler = StepLR(optimizer, step_size=1, gamma=train_config.gamma)
+    
+    log_gpu_memory("After optimizer creation", rank=rank)
     
     try:
         results = train(
@@ -760,6 +845,7 @@ def main():
             rank if train_config.enable_fsdp else None,
         )
     finally:
+        log_gpu_memory("End of training", rank=rank)
         if train_config.enable_fsdp:
             dist.destroy_process_group()
     
