@@ -41,6 +41,8 @@ from transformers.models.mllama.modeling_mllama import (
 )
 import wandb
 
+# Add this import
+from peft import get_peft_model, LoraConfig
 
 # Add GPU memory tracking functions
 def get_gpu_memory_info():
@@ -458,6 +460,7 @@ def get_dataloaders(train_config, processor):
 #
 #     return train_dataloader, valid_dataloader
 
+# In get_model_and_processor function:
 def get_model_and_processor(train_config):
     model = MllamaForConditionalGeneration.from_pretrained(
         train_config.model_name,
@@ -477,6 +480,17 @@ def get_model_and_processor(train_config):
     if len(processor.tokenizer) > model.get_input_embeddings().weight.shape[0]:
         print("WARNING: Resizing the embedding matrix to match the tokenizer vocab size.")
         model.resize_token_embeddings(len(processor.tokenizer))
+    
+    if train_config.use_peft:
+        peft_config = LoraConfig(
+            r=16,
+            lora_alpha=32,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            lora_dropout=0.05,
+            bias="none",
+        )
+        model = get_peft_model(model, peft_config)
+        print("Applied PEFT (LoRA) to model")
     
     return model, processor
 
