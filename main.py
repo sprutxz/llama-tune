@@ -475,8 +475,6 @@ def get_model_and_processor(train_config):
     if not processor.tokenizer.pad_token_id:
         processor.tokenizer.pad_token_id = processor.tokenizer.eos_token_id
         
-    # If there is a mismatch between tokenizer vocab size and embedding matrix,
-    # throw a warning and then expand the embedding matrix
     if len(processor.tokenizer) > model.get_input_embeddings().weight.shape[0]:
         print("WARNING: Resizing the embedding matrix to match the tokenizer vocab size.")
         model.resize_token_embeddings(len(processor.tokenizer))
@@ -491,6 +489,12 @@ def get_model_and_processor(train_config):
         )
         model = get_peft_model(model, peft_config)
         print("Applied PEFT (LoRA) to model")
+        
+        # Convert all PEFT adapter parameters to bfloat16
+        for name, param in model.named_parameters():
+            if param.dtype == torch.float32:
+                param.data = param.data.to(torch.bfloat16)
+                print(f"Converted parameter {name} from float32 to bfloat16")
     
     return model, processor
 
